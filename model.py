@@ -1,0 +1,171 @@
+from curses import newpad
+import math 
+import torch 
+import torch as nn 
+from torch.nn import Functional as F
+
+from mingpt.utils import CfgNode as CN
+
+
+
+
+
+class NewGeLU(nn.Module):
+    def forward(self, x):
+        return 0.5 * x * (1.0 * torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+
+class CausalSelfAttention(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__() 
+
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads ( k, q, v) 
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        #output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+
+        #regularization
+        self.attn_dropout = nn.Dropout(config.attn_pdrop)
+        self.resid_dropoout = nn.Dropout(config.resid_pdrop)
+        
+        #causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1,1, config.block_size, config.block_size))
+
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd) 
+
+        # calculate k, q, & v for all heads in a batch then move forward to the batch dim
+        q, k , v = self.c_attn(x).split(self.n_embd, dim=2) 
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1,2) 
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2) 
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1,2) 
+
+        #causal self-attention; Self-attend(B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 /math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('inf'))
+        att = F.softmax(att, dim=1) 
+        att = self.attn_dropout(att) 
+
+        y = att @ v 
+        y = y.transpose(1, 2).contiguous().view(B, T, C) 
+
+        y = self.resid_dropoout(self.c_proj(y))
+
+        return y 
+
+
+class Block(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__() 
+
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config) 
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = nn.ModuleDict(dict(
+            c_fc = nn.Linear(config.n_embd, 4 * config.n_embd), 
+            c_proj = nn.Linear(4 * config.n_embd, config.n_embd), 
+            act = NewGeLU(), 
+            dropout = nn.Dropout(config.resid_pdrop),
+        ))
+
+        m = self.mlp 
+        self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # mlp forward prop
+    
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlpf(self.ln_2(x)) 
+        return x
+
+class GPT(nn.Module):
+    """Generative Pre-Training Transformer Language Model"""
+    @staticmethod
+    
+    def get_default_config():
+        C = CN() 
+        # model_type or head, layer, or embd must be given during config
+
+        C.model_type = 'gpt'
+        C.n_layer = None
+        C.n_head = None
+        C.n_embd = None
+        ## externally filled options
+        
+        C.vocab_size = None
+        C.block_size = None
+
+        C.embd_pdrop = 0.1
+        C.resid_pdrop = 0.1
+        C.attn_pdrop = 0.1
+        return C 
+
+    def __init__(self, config):
+        super().__init__() 
+
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.block_size = config.block_size
+
+        type_given = config.model_type is not None
+        params_given = all([config.n_layer is not None, config.n_head is not None, config.n_embd is not None])
+        assert type_given ^ params_given # XOR
+
+        if type_given:
+            # hugging face naming conventions
+            #gpt-1
+            config.merge_from_dict({
+                'openai-gpt': dict(n_layer=12, n_head=12, n_embd=768),
+                'gpt2': dict(n_layer=12, n_head=12, n_embd=768),
+                'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),
+                'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),
+                'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),
+                #Gophers
+                'gopher-44m': dict(n_layer=8, n_head=16, n_embd=512), 
+                'gpt-mini': dict(n_layer=6, n_head=6, n_embd=192),
+                'gpt-micro': dict(n_layer=4, n_head=4, n_embd=128), 
+                'gpt-nano': dict(n_layer=3, n_head=3, n_embd=48),
+                }[config.model_type])
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd), 
+            wpe = nn.Embedding(config.block_size, config.n_embd), 
+            drop = nn.Dropout(config.embd_pdrop), 
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), 
+            ln_f = nn.LayerNorm(config.n_embd), 
+        ))
+
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        #init all weights, and apply a special scaled init to residual projections, per GPT-2 paper
+
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        n_params = sum(p.numel()for p in self.transformer.parameters())
+        print("number of parameters: %.2fM" % (n_params/1e6,))
+
+    def __init_weights(self, module):
+
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias) 
+            torch.nn.init.ones_(module.weight) 
+
+    @classmethod
+    
+    def from_pretrained(cls, model_type):
+
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel
+
+        pass
