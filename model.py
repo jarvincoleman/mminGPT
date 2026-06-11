@@ -1,9 +1,9 @@
 import math 
 import torch 
 import torch as nn 
-from torch.nn import Functional as F
+from torch.nn import functional as F
 
-from mingpt.utils import CfgNode as CN
+from utils import CfgNode as CN
 
 
 
