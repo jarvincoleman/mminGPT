@@ -1,4 +1,3 @@
-from curses import newpad
 import math 
 import torch 
 import torch as nn 
@@ -168,4 +167,107 @@ class GPT(nn.Module):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
 
-        pass
+        config = cls.get_default_config() 
+        config.model_type = model_type
+        config.vocab_size = 50257
+        config.block_size = 1024
+        model = GPT(config)
+        sd = model.state_dict()
+
+        model_hf = GPT2LMHeadModel
+        sd_hf = model_hf.state_dict()
+
+        keys = [k for k in sd_hf if not k.endswith('attn.masked_bias')]
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+        assert len(keys) == len(sd) 
+        for k in keys:
+            if any (k.endswith(w) for w in transposed):
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+    def configure_optimizers(self, train_config):
+
+        decay = set() 
+        no_decay = set() 
+        whitelist_weight_modules = (torch.nn.Linear)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+
+        for mn, m in self.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = '%s.%s' % (mn, pn) if mn else pn
+
+                if pn.endswith('bias'):
+                    no_decay.add(fpn) 
+
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    decay.add(fpn) 
+
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    no_decay.add(fpn) 
+        
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        inter_params = decay & no_decay 
+        union_params = decay | no_decay 
+
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
+        assert len(param_dict.keys() - union_params) == 0, "paramters %s were not separated into either decay/no_decay set!"(str(param_dict.keys() - union_params), )
+
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay":0.0},
+        ]
+        optimizer = torch.optim_AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
+        return optimizer
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size() 
+
+        assert t <= self.block_size, f"Cannot forward sequence of length {t}, blok size is only {self.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
+
+        tok_emb = self.transformer.wte(idx) 
+        pos_emb = self.transformer.wpe(pos) 
+        x = self.transformer.drop(tok_emb + pos_emb) 
+        for block in self.transformer.h:
+            x = block(x) 
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+        return logits, loss
+
+    @torch.no_grad() 
+
+    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.block_size else idx [:, -self.block_size:]
+            logits, _ = self(idx_cond) 
+
+            logits = logits[:, -1, :] / temperature
+
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            probs = F.softmax(logits, dim=-1) 
+
+            if do_sample:
+                idx_next = torch.multinomial(probs, num_samples=1)
+            else:
+                _, idx_next = torch.topk(probs, num_samples=1) 
+
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
