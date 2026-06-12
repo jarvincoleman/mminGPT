@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn 
 from torch.nn import functional as F
 
-from utils import CfgNode as CN
+from mmingpt.utils import CfgNode as CN
 
 
 

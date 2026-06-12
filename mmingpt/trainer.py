@@ -2,7 +2,7 @@ import time
 from collections import defaultdict
 import torch 
 from torch.utils.data.dataloader import DataLoader
-from utils import CfgNode as CN
+from mmingpt.utils import CfgNode as CN
 
 class Trainer:
     @staticmethod
