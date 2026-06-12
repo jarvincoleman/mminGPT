@@ -1,6 +1,6 @@
 import math 
 import torch 
-import torch as nn 
+import torch.nn as nn 
 from torch.nn import functional as F
 
 from utils import CfgNode as CN
@@ -217,7 +217,8 @@ class GPT(nn.Module):
         union_params = decay | no_decay 
 
         assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
-        assert len(param_dict.keys() - union_params) == 0, "paramters %s were not separated into either decay/no_decay set!"(str(param_dict.keys() - union_params), )
+        assert len(param_dict.keys() - union_params) == 0,"parameters %s were not separated into either decay/no_decay set!" \
+                                                    % (str(param_dict.keys() - union_params), ) 
 
         optim_groups = [
             {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
