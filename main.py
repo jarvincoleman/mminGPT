@@ -9,5 +9,3 @@ from mingpt.utils import set_seed, setup_logging, CfgNode as CN
 def get_config():
 
     C = CN()
-    
-    C.system = CN()
